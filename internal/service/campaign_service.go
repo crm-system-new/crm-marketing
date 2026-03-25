@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/crm-system-new/crm-marketing/internal/domain"
-	"github.com/crm-system-new/crm-shared/pkg/ddd"
-	"github.com/crm-system-new/crm-shared/pkg/messaging"
+	"github.com/crm-system-new/crm-marketing/internal/infrastructure/postgres"
+	"github.com/crm-system-new/crm-shared/pkg/audit"
+	"github.com/crm-system-new/crm-shared/pkg/outbox"
 )
 
 type CreateCampaignRequest struct {
@@ -33,12 +36,14 @@ type CampaignResponse struct {
 }
 
 type CampaignService struct {
-	repo      domain.CampaignRepository
-	publisher messaging.EventPublisher
+	repo        *postgres.CampaignRepository
+	pool        *pgxpool.Pool
+	outboxStore outbox.Store
+	auditLogger *audit.Logger
 }
 
-func NewCampaignService(repo domain.CampaignRepository, publisher messaging.EventPublisher) *CampaignService {
-	return &CampaignService{repo: repo, publisher: publisher}
+func NewCampaignService(repo *postgres.CampaignRepository, pool *pgxpool.Pool, outboxStore outbox.Store, auditLogger *audit.Logger) *CampaignService {
+	return &CampaignService{repo: repo, pool: pool, outboxStore: outboxStore, auditLogger: auditLogger}
 }
 
 func (s *CampaignService) CreateCampaign(ctx context.Context, req CreateCampaignRequest) (*CampaignResponse, error) {
@@ -55,11 +60,43 @@ func (s *CampaignService) CreateCampaign(ctx context.Context, req CreateCampaign
 		return nil, err
 	}
 
-	if err := s.repo.Save(ctx, campaign); err != nil {
+	events := campaign.PullEvents()
+	entries, err := outbox.FromDomainEvents(events, "crm.")
+	if err != nil {
+		return nil, fmt.Errorf("convert events to outbox: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.SaveInTx(ctx, tx, campaign); err != nil {
 		return nil, fmt.Errorf("save campaign: %w", err)
 	}
 
-	s.publishEvents(ctx, campaign.PullEvents())
+	if len(entries) > 0 {
+		if err := s.outboxStore.InsertInTx(ctx, tx, entries); err != nil {
+			return nil, fmt.Errorf("insert outbox: %w", err)
+		}
+	}
+
+	changes, _ := json.Marshal(map[string]string{"name": campaign.Name, "channel": campaign.Channel})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "create",
+		EntityType: "campaign",
+		EntityID:   campaign.ID,
+		UserID:     "",
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
 	return toCampaignResponse(campaign), nil
 }
 
@@ -81,11 +118,43 @@ func (s *CampaignService) LaunchCampaign(ctx context.Context, id string) (*Campa
 		return nil, err
 	}
 
-	if err := s.repo.Update(ctx, campaign); err != nil {
+	events := campaign.PullEvents()
+	entries, err := outbox.FromDomainEvents(events, "crm.")
+	if err != nil {
+		return nil, fmt.Errorf("convert events to outbox: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.UpdateInTx(ctx, tx, campaign); err != nil {
 		return nil, fmt.Errorf("update campaign: %w", err)
 	}
 
-	s.publishEvents(ctx, campaign.PullEvents())
+	if len(entries) > 0 {
+		if err := s.outboxStore.InsertInTx(ctx, tx, entries); err != nil {
+			return nil, fmt.Errorf("insert outbox: %w", err)
+		}
+	}
+
+	changes, _ := json.Marshal(map[string]string{"action": "launch"})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "status_change",
+		EntityType: "campaign",
+		EntityID:   campaign.ID,
+		UserID:     "",
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
 	return toCampaignResponse(campaign), nil
 }
 
@@ -117,13 +186,6 @@ func (s *CampaignService) ListCampaigns(ctx context.Context, filter domain.Campa
 		responses[i] = toCampaignResponse(c)
 	}
 	return responses, total, nil
-}
-
-func (s *CampaignService) publishEvents(ctx context.Context, events []ddd.DomainEvent) {
-	for _, event := range events {
-		data, _ := json.Marshal(event)
-		s.publisher.Publish(ctx, "crm."+event.EventType(), data)
-	}
 }
 
 func toCampaignResponse(c *domain.Campaign) *CampaignResponse {

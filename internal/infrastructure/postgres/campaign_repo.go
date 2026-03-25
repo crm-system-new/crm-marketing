@@ -53,6 +53,21 @@ func (r *CampaignRepository) Save(ctx context.Context, campaign *domain.Campaign
 	return nil
 }
 
+func (r *CampaignRepository) SaveInTx(ctx context.Context, tx pgx.Tx, campaign *domain.Campaign) error {
+	query := `INSERT INTO campaigns (id, name, description, status, channel, segment_id, scheduled_at, sent_count, open_rate, click_rate, version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
+
+	_, err := tx.Exec(ctx, query,
+		campaign.ID, campaign.Name, campaign.Description, campaign.Status, campaign.Channel,
+		campaign.SegmentID, campaign.ScheduledAt, campaign.SentCount, campaign.OpenRate, campaign.ClickRate,
+		campaign.Version, campaign.CreatedAt, campaign.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert campaign in tx: %w", err)
+	}
+	return nil
+}
+
 func (r *CampaignRepository) Update(ctx context.Context, campaign *domain.Campaign) error {
 	oldVersion := campaign.Version
 	campaign.IncrementVersion()
@@ -63,6 +78,23 @@ func (r *CampaignRepository) Update(ctx context.Context, campaign *domain.Campai
 		WHERE id=$12 AND version=$13`
 
 	return sharedpg.ExecWithOptimisticLockPool(ctx, r.pool, query,
+		campaign.Name, campaign.Description, campaign.Status, campaign.Channel,
+		campaign.SegmentID, campaign.ScheduledAt, campaign.SentCount, campaign.OpenRate, campaign.ClickRate,
+		campaign.UpdatedAt, campaign.Version,
+		campaign.ID, oldVersion,
+	)
+}
+
+func (r *CampaignRepository) UpdateInTx(ctx context.Context, tx pgx.Tx, campaign *domain.Campaign) error {
+	oldVersion := campaign.Version
+	campaign.IncrementVersion()
+
+	query := `UPDATE campaigns SET name=$1, description=$2, status=$3, channel=$4,
+		segment_id=$5, scheduled_at=$6, sent_count=$7, open_rate=$8, click_rate=$9,
+		updated_at=$10, version=$11
+		WHERE id=$12 AND version=$13`
+
+	return sharedpg.ExecWithOptimisticLock(ctx, tx, query,
 		campaign.Name, campaign.Description, campaign.Status, campaign.Channel,
 		campaign.SegmentID, campaign.ScheduledAt, campaign.SentCount, campaign.OpenRate, campaign.ClickRate,
 		campaign.UpdatedAt, campaign.Version,

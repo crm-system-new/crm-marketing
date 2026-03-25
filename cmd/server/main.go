@@ -14,9 +14,13 @@ import (
 	inframsg "github.com/crm-system-new/crm-marketing/internal/infrastructure/messaging"
 	"github.com/crm-system-new/crm-marketing/internal/infrastructure/postgres"
 	"github.com/crm-system-new/crm-marketing/internal/service"
+	"github.com/crm-system-new/crm-shared/pkg/audit"
 	"github.com/crm-system-new/crm-shared/pkg/auth"
 	"github.com/crm-system-new/crm-shared/pkg/config"
+	"github.com/crm-system-new/crm-shared/pkg/health"
+	"github.com/crm-system-new/crm-shared/pkg/idempotency"
 	sharedotel "github.com/crm-system-new/crm-shared/pkg/otel"
+	"github.com/crm-system-new/crm-shared/pkg/outbox"
 	sharedpg "github.com/crm-system-new/crm-shared/pkg/postgres"
 )
 
@@ -56,28 +60,39 @@ func main() {
 
 	jwtManager := auth.NewJWTManager(cfg.JWTSecret, 15*time.Minute, 7*24*time.Hour)
 
+	// Production infrastructure
+	outboxStore := outbox.NewPgStore(pool)
+	auditLogger := audit.NewLogger(pool)
+	idempotencyStore := idempotency.NewStore(pool)
+	healthChecker := health.NewChecker(pool, cfg.NatsURL)
+
 	// Wire dependencies
 	campaignRepo := postgres.NewCampaignRepository(pool)
 	segmentRepo := postgres.NewSegmentRepository(pool)
 	subscriberRepo := postgres.NewSubscriberRepository(pool)
 
-	campaignService := service.NewCampaignService(campaignRepo, publisher)
-	segmentService := service.NewSegmentService(segmentRepo)
-	subscriberService := service.NewSubscriberService(subscriberRepo, publisher)
+	campaignService := service.NewCampaignService(campaignRepo, pool, outboxStore, auditLogger)
+	segmentService := service.NewSegmentService(segmentRepo, pool, outboxStore, auditLogger)
+	subscriberService := service.NewSubscriberService(subscriberRepo, pool, outboxStore, auditLogger)
 
 	campaignHandler := handler.NewCampaignHandler(campaignService)
 	segmentHandler := handler.NewSegmentHandler(segmentService)
 	subscriberHandler := handler.NewSubscriberHandler(subscriberService)
 
+	// Start outbox relay (polls outbox table and publishes to NATS)
+	relay := outbox.NewRelay(outboxStore, publisher, 2*time.Second, 100)
+	relay.Start()
+	defer relay.Stop()
+
 	// Start sales event subscriber (consumes lead.created, customer.created)
-	salesSubscriber, err := inframsg.NewSalesEventSubscriber(cfg.NatsURL, subscriberRepo)
+	salesSubscriber, err := inframsg.NewSalesEventSubscriber(cfg.NatsURL, subscriberRepo, idempotencyStore)
 	if err != nil {
 		log.Printf("WARN: failed to start sales event subscriber: %v", err)
 	} else {
 		defer salesSubscriber.Close()
 	}
 
-	router := handler.NewRouter(campaignHandler, segmentHandler, subscriberHandler, jwtManager)
+	router := handler.NewRouter(campaignHandler, segmentHandler, subscriberHandler, jwtManager, healthChecker)
 
 	addr := fmt.Sprintf(":%d", cfg.ServicePort)
 	srv := &http.Server{

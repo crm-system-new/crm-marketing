@@ -70,6 +70,21 @@ func (r *SubscriberRepository) Save(ctx context.Context, subscriber *domain.Subs
 	return nil
 }
 
+func (r *SubscriberRepository) SaveInTx(ctx context.Context, tx pgx.Tx, subscriber *domain.Subscriber) error {
+	query := `INSERT INTO subscribers (id, email, first_name, last_name, status, preferences, version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+
+	_, err := tx.Exec(ctx, query,
+		subscriber.ID, subscriber.Email, subscriber.FirstName, subscriber.LastName,
+		subscriber.Status, subscriber.Preferences,
+		subscriber.Version, subscriber.CreatedAt, subscriber.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert subscriber in tx: %w", err)
+	}
+	return nil
+}
+
 func (r *SubscriberRepository) Update(ctx context.Context, subscriber *domain.Subscriber) error {
 	oldVersion := subscriber.Version
 	subscriber.IncrementVersion()
@@ -79,6 +94,21 @@ func (r *SubscriberRepository) Update(ctx context.Context, subscriber *domain.Su
 		WHERE id=$8 AND version=$9`
 
 	return sharedpg.ExecWithOptimisticLockPool(ctx, r.pool, query,
+		subscriber.Email, subscriber.FirstName, subscriber.LastName, subscriber.Status,
+		subscriber.Preferences, subscriber.UpdatedAt, subscriber.Version,
+		subscriber.ID, oldVersion,
+	)
+}
+
+func (r *SubscriberRepository) UpdateInTx(ctx context.Context, tx pgx.Tx, subscriber *domain.Subscriber) error {
+	oldVersion := subscriber.Version
+	subscriber.IncrementVersion()
+
+	query := `UPDATE subscribers SET email=$1, first_name=$2, last_name=$3, status=$4,
+		preferences=$5, updated_at=$6, version=$7
+		WHERE id=$8 AND version=$9`
+
+	return sharedpg.ExecWithOptimisticLock(ctx, tx, query,
 		subscriber.Email, subscriber.FirstName, subscriber.LastName, subscriber.Status,
 		subscriber.Preferences, subscriber.UpdatedAt, subscriber.Version,
 		subscriber.ID, oldVersion,

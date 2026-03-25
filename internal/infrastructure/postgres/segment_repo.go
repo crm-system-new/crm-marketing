@@ -51,6 +51,20 @@ func (r *SegmentRepository) Save(ctx context.Context, segment *domain.Segment) e
 	return nil
 }
 
+func (r *SegmentRepository) SaveInTx(ctx context.Context, tx pgx.Tx, segment *domain.Segment) error {
+	query := `INSERT INTO segments (id, name, criteria, subscriber_count, version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+	_, err := tx.Exec(ctx, query,
+		segment.ID, segment.Name, segment.Criteria, segment.SubscriberCount,
+		segment.Version, segment.CreatedAt, segment.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert segment in tx: %w", err)
+	}
+	return nil
+}
+
 func (r *SegmentRepository) Update(ctx context.Context, segment *domain.Segment) error {
 	oldVersion := segment.Version
 	segment.IncrementVersion()
@@ -60,6 +74,21 @@ func (r *SegmentRepository) Update(ctx context.Context, segment *domain.Segment)
 		WHERE id=$6 AND version=$7`
 
 	return sharedpg.ExecWithOptimisticLockPool(ctx, r.pool, query,
+		segment.Name, segment.Criteria, segment.SubscriberCount,
+		segment.UpdatedAt, segment.Version,
+		segment.ID, oldVersion,
+	)
+}
+
+func (r *SegmentRepository) UpdateInTx(ctx context.Context, tx pgx.Tx, segment *domain.Segment) error {
+	oldVersion := segment.Version
+	segment.IncrementVersion()
+
+	query := `UPDATE segments SET name=$1, criteria=$2, subscriber_count=$3,
+		updated_at=$4, version=$5
+		WHERE id=$6 AND version=$7`
+
+	return sharedpg.ExecWithOptimisticLock(ctx, tx, query,
 		segment.Name, segment.Criteria, segment.SubscriberCount,
 		segment.UpdatedAt, segment.Version,
 		segment.ID, oldVersion,

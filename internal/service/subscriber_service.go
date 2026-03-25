@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/crm-system-new/crm-marketing/internal/domain"
-	"github.com/crm-system-new/crm-shared/pkg/ddd"
-	"github.com/crm-system-new/crm-shared/pkg/messaging"
+	"github.com/crm-system-new/crm-marketing/internal/infrastructure/postgres"
+	"github.com/crm-system-new/crm-shared/pkg/audit"
+	"github.com/crm-system-new/crm-shared/pkg/outbox"
 )
 
 type SubscribeRequest struct {
@@ -30,12 +33,14 @@ type SubscriberResponse struct {
 }
 
 type SubscriberService struct {
-	repo      domain.SubscriberRepository
-	publisher messaging.EventPublisher
+	repo        *postgres.SubscriberRepository
+	pool        *pgxpool.Pool
+	outboxStore outbox.Store
+	auditLogger *audit.Logger
 }
 
-func NewSubscriberService(repo domain.SubscriberRepository, publisher messaging.EventPublisher) *SubscriberService {
-	return &SubscriberService{repo: repo, publisher: publisher}
+func NewSubscriberService(repo *postgres.SubscriberRepository, pool *pgxpool.Pool, outboxStore outbox.Store, auditLogger *audit.Logger) *SubscriberService {
+	return &SubscriberService{repo: repo, pool: pool, outboxStore: outboxStore, auditLogger: auditLogger}
 }
 
 func (s *SubscriberService) Subscribe(ctx context.Context, req SubscribeRequest) (*SubscriberResponse, error) {
@@ -44,11 +49,43 @@ func (s *SubscriberService) Subscribe(ctx context.Context, req SubscribeRequest)
 		return nil, err
 	}
 
-	if err := s.repo.Save(ctx, subscriber); err != nil {
+	events := subscriber.PullEvents()
+	entries, err := outbox.FromDomainEvents(events, "crm.")
+	if err != nil {
+		return nil, fmt.Errorf("convert events to outbox: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.SaveInTx(ctx, tx, subscriber); err != nil {
 		return nil, fmt.Errorf("save subscriber: %w", err)
 	}
 
-	s.publishEvents(ctx, subscriber.PullEvents())
+	if len(entries) > 0 {
+		if err := s.outboxStore.InsertInTx(ctx, tx, entries); err != nil {
+			return nil, fmt.Errorf("insert outbox: %w", err)
+		}
+	}
+
+	changes, _ := json.Marshal(map[string]string{"email": subscriber.Email})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "create",
+		EntityType: "subscriber",
+		EntityID:   subscriber.ID,
+		UserID:     "",
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
 	return toSubscriberResponse(subscriber), nil
 }
 
@@ -70,11 +107,43 @@ func (s *SubscriberService) Unsubscribe(ctx context.Context, id string) (*Subscr
 		return nil, err
 	}
 
-	if err := s.repo.Update(ctx, subscriber); err != nil {
+	events := subscriber.PullEvents()
+	entries, err := outbox.FromDomainEvents(events, "crm.")
+	if err != nil {
+		return nil, fmt.Errorf("convert events to outbox: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.UpdateInTx(ctx, tx, subscriber); err != nil {
 		return nil, fmt.Errorf("update subscriber: %w", err)
 	}
 
-	s.publishEvents(ctx, subscriber.PullEvents())
+	if len(entries) > 0 {
+		if err := s.outboxStore.InsertInTx(ctx, tx, entries); err != nil {
+			return nil, fmt.Errorf("insert outbox: %w", err)
+		}
+	}
+
+	changes, _ := json.Marshal(map[string]string{"status": "unsubscribed"})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "status_change",
+		EntityType: "subscriber",
+		EntityID:   subscriber.ID,
+		UserID:     "",
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
 	return toSubscriberResponse(subscriber), nil
 }
 
@@ -106,13 +175,6 @@ func (s *SubscriberService) ListSubscribers(ctx context.Context, filter domain.S
 		responses[i] = toSubscriberResponse(sub)
 	}
 	return responses, total, nil
-}
-
-func (s *SubscriberService) publishEvents(ctx context.Context, events []ddd.DomainEvent) {
-	for _, event := range events {
-		data, _ := json.Marshal(event)
-		s.publisher.Publish(ctx, "crm."+event.EventType(), data)
-	}
 }
 
 func toSubscriberResponse(sub *domain.Subscriber) *SubscriberResponse {

@@ -2,9 +2,15 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/crm-system-new/crm-marketing/internal/domain"
+	"github.com/crm-system-new/crm-marketing/internal/infrastructure/postgres"
+	"github.com/crm-system-new/crm-shared/pkg/audit"
+	"github.com/crm-system-new/crm-shared/pkg/outbox"
 )
 
 type CreateSegmentRequest struct {
@@ -25,11 +31,14 @@ type SegmentResponse struct {
 }
 
 type SegmentService struct {
-	repo domain.SegmentRepository
+	repo        *postgres.SegmentRepository
+	pool        *pgxpool.Pool
+	outboxStore outbox.Store
+	auditLogger *audit.Logger
 }
 
-func NewSegmentService(repo domain.SegmentRepository) *SegmentService {
-	return &SegmentService{repo: repo}
+func NewSegmentService(repo *postgres.SegmentRepository, pool *pgxpool.Pool, outboxStore outbox.Store, auditLogger *audit.Logger) *SegmentService {
+	return &SegmentService{repo: repo, pool: pool, outboxStore: outboxStore, auditLogger: auditLogger}
 }
 
 func (s *SegmentService) CreateSegment(ctx context.Context, req CreateSegmentRequest) (*SegmentResponse, error) {
@@ -38,8 +47,29 @@ func (s *SegmentService) CreateSegment(ctx context.Context, req CreateSegmentReq
 		return nil, err
 	}
 
-	if err := s.repo.Save(ctx, segment); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.SaveInTx(ctx, tx, segment); err != nil {
 		return nil, fmt.Errorf("save segment: %w", err)
+	}
+
+	changes, _ := json.Marshal(map[string]string{"name": segment.Name})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "create",
+		EntityType: "segment",
+		EntityID:   segment.ID,
+		UserID:     "",
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	return toSegmentResponse(segment), nil
@@ -63,8 +93,29 @@ func (s *SegmentService) UpdateSegment(ctx context.Context, id string, req Updat
 		return nil, err
 	}
 
-	if err := s.repo.Update(ctx, segment); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.UpdateInTx(ctx, tx, segment); err != nil {
 		return nil, fmt.Errorf("update segment: %w", err)
+	}
+
+	changes, _ := json.Marshal(map[string]string{"name": segment.Name, "criteria": segment.Criteria})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "update",
+		EntityType: "segment",
+		EntityID:   segment.ID,
+		UserID:     "",
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	return toSegmentResponse(segment), nil

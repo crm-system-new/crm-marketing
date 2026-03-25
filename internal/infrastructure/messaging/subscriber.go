@@ -5,28 +5,37 @@ import (
 	"encoding/json"
 	"log"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/crm-system-new/crm-marketing/internal/domain"
+	"github.com/crm-system-new/crm-marketing/internal/infrastructure/acl"
+	"github.com/crm-system-new/crm-marketing/internal/infrastructure/postgres"
+	"github.com/crm-system-new/crm-shared/pkg/idempotency"
 	"github.com/crm-system-new/crm-shared/pkg/messaging"
 	natssub "github.com/crm-system-new/crm-shared/pkg/messaging/nats"
 )
 
 // SalesEventSubscriber consumes events from the Sales bounded context
 // and auto-creates marketing subscribers from leads and customers.
+// It uses the ACL to translate external events and the idempotency store
+// to prevent duplicate processing.
 type SalesEventSubscriber struct {
-	subscriber     *natssub.Subscriber
-	subscriberRepo domain.SubscriberRepository
+	subscriber       *natssub.Subscriber
+	subscriberRepo   *postgres.SubscriberRepository
+	idempotencyStore *idempotency.Store
 }
 
 // NewSalesEventSubscriber creates a subscriber that listens to sales events.
-func NewSalesEventSubscriber(natsURL string, subscriberRepo domain.SubscriberRepository) (*SalesEventSubscriber, error) {
+func NewSalesEventSubscriber(natsURL string, subscriberRepo *postgres.SubscriberRepository, idempotencyStore *idempotency.Store) (*SalesEventSubscriber, error) {
 	sub, err := natssub.NewSubscriber(natsURL, "marketing-service")
 	if err != nil {
 		return nil, err
 	}
 
 	s := &SalesEventSubscriber{
-		subscriber:     sub,
-		subscriberRepo: subscriberRepo,
+		subscriber:       sub,
+		subscriberRepo:   subscriberRepo,
+		idempotencyStore: idempotencyStore,
 	}
 
 	if err := s.setup(); err != nil {
@@ -48,11 +57,7 @@ func (s *SalesEventSubscriber) setup() error {
 }
 
 func (s *SalesEventSubscriber) handleLeadCreated(_ context.Context, _ string, data []byte) error {
-	var event struct {
-		Email     string `json:"email"`
-		FirstName string `json:"first_name"`
-		LastName  string `json:"last_name"`
-	}
+	var event acl.SalesLeadCreatedEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return err
 	}
@@ -61,14 +66,15 @@ func (s *SalesEventSubscriber) handleLeadCreated(_ context.Context, _ string, da
 		return nil
 	}
 
-	return s.ensureSubscriber(event.Email, event.FirstName, event.LastName)
+	cmd := acl.TranslateLeadCreated(event)
+
+	return s.idempotencyStore.ProcessOnce(context.Background(), event.EventID, func(ctx context.Context, tx pgx.Tx) error {
+		return s.ensureSubscriberInTx(ctx, tx, cmd)
+	})
 }
 
 func (s *SalesEventSubscriber) handleCustomerCreated(_ context.Context, _ string, data []byte) error {
-	var event struct {
-		Name  string `json:"name"`
-		Email string `json:"email"`
-	}
+	var event acl.SalesCustomerCreatedEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return err
 	}
@@ -77,20 +83,22 @@ func (s *SalesEventSubscriber) handleCustomerCreated(_ context.Context, _ string
 		return nil
 	}
 
-	return s.ensureSubscriber(event.Email, event.Name, "")
+	cmd := acl.TranslateCustomerCreated(event)
+
+	return s.idempotencyStore.ProcessOnce(context.Background(), event.EventID, func(ctx context.Context, tx pgx.Tx) error {
+		return s.ensureSubscriberInTx(ctx, tx, cmd)
+	})
 }
 
-func (s *SalesEventSubscriber) ensureSubscriber(email, firstName, lastName string) error {
-	ctx := context.Background()
-
+func (s *SalesEventSubscriber) ensureSubscriberInTx(ctx context.Context, tx pgx.Tx, cmd *acl.AddSubscriberCommand) error {
 	// Check if subscriber already exists
-	_, err := s.subscriberRepo.GetByEmail(ctx, email)
+	_, err := s.subscriberRepo.GetByEmail(ctx, cmd.Email)
 	if err == nil {
 		// Already exists, skip
 		return nil
 	}
 
-	subscriber, err := domain.NewSubscriber(email, firstName, lastName)
+	subscriber, err := domain.NewSubscriber(cmd.Email, cmd.FirstName, cmd.LastName)
 	if err != nil {
 		log.Printf("WARN: failed to create subscriber from sales event: %v", err)
 		return nil
@@ -99,16 +107,16 @@ func (s *SalesEventSubscriber) ensureSubscriber(email, firstName, lastName strin
 	// Discard events since these are internally triggered
 	subscriber.PullEvents()
 
-	if err := s.subscriberRepo.Save(ctx, subscriber); err != nil {
+	if err := s.subscriberRepo.SaveInTx(ctx, tx, subscriber); err != nil {
 		log.Printf("WARN: failed to save subscriber from sales event: %v", err)
 		return nil
 	}
 
-	log.Printf("Auto-created subscriber %s from sales event", email)
+	log.Printf("Auto-created subscriber %s from sales event", cmd.Email)
 	return nil
 }
 
-// Expose the underlying subscriber's Close for use by main.
+// Close shuts down the underlying NATS subscriber.
 func (s *SalesEventSubscriber) Close() error {
 	return s.subscriber.Close()
 }
